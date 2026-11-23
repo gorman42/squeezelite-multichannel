@@ -43,7 +43,108 @@ s32_t to_gain(float f) {
 	return (s32_t)(f * 65536.0F);
 }
 
+extern struct outputstate output;
+
+static void _scale_and_pack_frames_mch(void *outputptr, s32_t *inputptr, frames_t cnt, u8_t channels, output_format format) {
+	frames_t i;
+	u8_t ch;
+	bool unity = true;
+
+	for (ch = 0; ch < channels && ch < MAX_CHANNELS; ++ch) {
+		if (output.gain[ch] != FIXED_ONE) {
+			unity = false;
+			break;
+		}
+	}
+
+	switch (format) {
+	case S32_LE:
+		{
+			u32_t *optr = (u32_t *)(void *)outputptr;
+#if SL_LITTLE_ENDIAN
+			if (unity) {
+				memcpy(outputptr, inputptr, cnt * channels * sizeof(s32_t));
+			} else {
+				for (i = 0; i < cnt; ++i) {
+					for (ch = 0; ch < channels; ++ch) {
+						s32_t sample = *(inputptr++);
+						*(optr++) = (u32_t)gain(output.gain[ch], sample);
+					}
+				}
+			}
+#else
+			for (i = 0; i < cnt; ++i) {
+				for (ch = 0; ch < channels; ++ch) {
+					s32_t sample = unity ? *(inputptr++) : gain(output.gain[ch], *(inputptr++));
+					*(optr++) =
+						(sample & 0xff000000) >> 24 | (sample & 0x00ff0000) >> 8 |
+						(sample & 0x0000ff00) << 8  | (sample & 0x000000ff) << 24;
+				}
+			}
+#endif
+		}
+		break;
+	case S24_LE:
+		{
+			u32_t *optr = (u32_t *)(void *)outputptr;
+			for (i = 0; i < cnt; ++i) {
+				for (ch = 0; ch < channels; ++ch) {
+					s32_t sample = unity ? *(inputptr++) : gain(output.gain[ch], *(inputptr++));
+#if SL_LITTLE_ENDIAN
+					*(optr++) = (u32_t)(sample >> 8);
+#else
+					*(optr++) =
+						(sample & 0xff000000) >> 16 | (sample & 0x00ff0000) | ((sample & 0x0000ff00) << 16);
+#endif
+				}
+			}
+		}
+		break;
+	case S24_3LE:
+		{
+			u8_t *optr = (u8_t *)(void *)outputptr;
+			for (i = 0; i < cnt; ++i) {
+				for (ch = 0; ch < channels; ++ch) {
+					s32_t sample = unity ? *(inputptr++) : gain(output.gain[ch], *(inputptr++));
+					*(optr++) = (sample & 0x0000ff00) >>  8;
+					*(optr++) = (sample & 0x00ff0000) >> 16;
+					*(optr++) = (sample & 0xff000000) >> 24;
+				}
+			}
+		}
+		break;
+	case S16_LE:
+		{
+			u16_t *optr = (u16_t *)(void *)outputptr;
+			for (i = 0; i < cnt; ++i) {
+				for (ch = 0; ch < channels; ++ch) {
+					s32_t sample = unity ? *(inputptr++) : gain(output.gain[ch], *(inputptr++));
+					u16_t s16 = (u16_t)(sample >> 16);
+#if SL_LITTLE_ENDIAN
+					*(optr++) = s16;
+#else
+					*(optr++) = (u16_t)((s16 >> 8) | (s16 << 8));
+#endif
+				}
+			}
+		}
+		break;
+	default:
+		break;
+	}
+}
+
 void _scale_and_pack_frames(void *outputptr, s32_t *inputptr, frames_t cnt, s32_t gainL, s32_t gainR, u8_t flags, output_format format) {
+	if (output.is_bitstream) {
+		memcpy(outputptr, inputptr, cnt * output_frame_bytes(output.out_channels, true));
+		return;
+	}
+
+	if (output.out_channels > 2) {
+		_scale_and_pack_frames_mch(outputptr, inputptr, cnt, output.out_channels, format);
+		return;
+	}
+
 	// in-place copy input samples if mono/combined is used (never happens with DSD active)
 	if ((flags & MONO_LEFT) && (flags & MONO_RIGHT)) {
 		s32_t *ptr = inputptr;
@@ -379,6 +480,25 @@ void _apply_cross(struct buffer *outputbuf, frames_t out_frames, s32_t cross_gai
 inline 
 #endif
 void _apply_gain(struct buffer *outputbuf, frames_t count, s32_t gainL, s32_t gainR, u8_t flags) {
+	if (output.is_bitstream) {
+		return;
+	}
+
+	if (output.out_channels > 2) {
+		ISAMPLE_T *ptr = (ISAMPLE_T *)(void *)outputbuf->readp;
+		u8_t channels = output.out_channels;
+		u8_t ch;
+		while (count--) {
+			for (ch = 0; ch < channels && ch < MAX_CHANNELS; ++ch) {
+				if (output.gain[ch] != FIXED_ONE) {
+					ptr[ch] = gain(output.gain[ch], ptr[ch]);
+				}
+			}
+			ptr += channels;
+		}
+		return;
+	}
+
 	if (gainL == FIXED_ONE && gainR == FIXED_ONE && !(flags & (MONO_LEFT | MONO_RIGHT))) {
 		return;
 	} else if ((flags & MONO_LEFT) && (flags & MONO_RIGHT)) {

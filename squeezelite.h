@@ -448,6 +448,11 @@ struct wake {
 #define FIXED_ONE 0x10000
 
 #define BYTES_PER_FRAME 8
+#define MAX_CHANNELS 8
+
+static inline unsigned output_frame_bytes(u8_t channels, bool is_bitstream) {
+	return (unsigned)(channels ? channels : 2) * (is_bitstream ? sizeof(s16_t) : sizeof(s32_t));
+}
 
 #if BYTES_PER_FRAME == 8
 #define ISAMPLE_T 		s32_t
@@ -648,6 +653,11 @@ struct outputstate {
 	output_state state;
 	output_format format;
 	u8_t channels;
+	u8_t out_channels;         // active output channels: 2, 6, or 8
+	u8_t next_channels;        // next track output channels: 2, 6, or 8
+	bool is_bitstream;         // true for IEC 61937 passthrough ('E', 'T', 'H')
+	bool next_is_bitstream;    // true if next track is IEC 61937 passthrough
+	u32_t gain[MAX_CHANNELS];  // per-channel fixed-point 16.16 gain (unity = 0x10000)
 	const char *device;
 #if ALSA
 	unsigned buffer;
@@ -770,7 +780,7 @@ void dsd_init(dsd_format format, unsigned delay);
 #endif
 
 // codecs
-#define MAX_CODECS 10
+#define MAX_CODECS 16
 
 struct codec *register_flac(void);
 struct codec *register_pcm(void);

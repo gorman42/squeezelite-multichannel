@@ -161,20 +161,53 @@ static FLAC__StreamDecoderReadStatus read_cb(const FLAC__StreamDecoder *decoder,
 	return end ? FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM : FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
 }
 
+// FLAC (SMPTE/ITU-R) to ALSA CEA-861 speaker swizzle lookup table
+// Index is ALSA output channel (0..7); value is FLAC buffer[] index, or -1 for silence fill
+static const signed char flac_to_cea861_map[9][MAX_CHANNELS] = {
+	{ -1, -1, -1, -1, -1, -1, -1, -1 }, // 0: invalid
+	{  0,  0, -1, -1, -1, -1, -1, -1 }, // 1: 1.0 Mono -> L, R
+	{  0,  1, -1, -1, -1, -1, -1, -1 }, // 2: 2.0 Stereo -> FL, FR
+	{  0,  1, -1,  2, -1, -1, -1, -1 }, // 3: 3.0 (FL,FR,FC) -> FL, FR, Silence, FC, Silence, Silence
+	{  0,  1, -1, -1,  2,  3, -1, -1 }, // 4: 4.0 Quad (FL,FR,BL,BR) -> FL, FR, Silence, Silence, BL, BR
+	{  0,  1, -1,  2,  3,  4, -1, -1 }, // 5: 5.0 (FL,FR,FC,BL,BR) -> FL, FR, Silence, FC, BL, BR
+	{  0,  1,  3,  2,  4,  5, -1, -1 }, // 6: 5.1 (FL,FR,FC,LFE,BL,BR) -> FL, FR, LFE, FC, BL, BR
+	{  0,  1,  3,  2,  5,  6,  4, -1 }, // 7: 6.1 (FL,FR,FC,LFE,BC,SL,SR) -> FL, FR, LFE, FC, SL, SR, BC, Silence
+	{  0,  1,  3,  2,  4,  5,  6,  7 }, // 8: 7.1 (FL,FR,FC,LFE,BL,BR,SL,SR) -> FL, FR, LFE, FC, BL, BR, SL, SR
+};
+
+static inline u8_t normalize_hdmi_channels(unsigned channels) {
+	if (channels <= 2) return 2;
+	if (channels <= 6) return 6;
+	return 8;
+}
+
 static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame,
 											   const FLAC__int32 *const buffer[], void *client_data) {
 
 	size_t frames = frame->header.blocksize;
+	size_t offset = 0;
 	unsigned bits_per_sample = frame->header.bits_per_sample;
 	unsigned channels = frame->header.channels;
+	u8_t out_channels;
+	unsigned frame_bytes;
+
+	if (channels == 0 || channels > MAX_CHANNELS) {
+		LOG_ERROR("unsupported flac channel count: %u", channels);
+		return FLAC__STREAM_DECODER_WRITE_STATUS_ABORT;
+	}
+
+	out_channels = normalize_hdmi_channels(channels);
+	frame_bytes = output_frame_bytes(out_channels, false);
 
 	FLAC__int32 *lptr = (FLAC__int32 *)buffer[0];
 	FLAC__int32 *rptr = (FLAC__int32 *)buffer[channels > 1 ? 1 : 0];
 	
 	if (decode.new_stream) {
 		LOCK_O;
-		LOG_INFO("setting track_start");
+		LOG_INFO("setting track_start (in_ch=%u, out_ch=%u)", channels, out_channels);
 		output.track_start = outputbuf->writep;
+		output.next_channels = out_channels;
+		output.next_is_bitstream = false;
 		decode.new_stream = false;
 
 #if DSD
@@ -183,7 +216,7 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 #else
 #define MARKER_OFFSET 1
 #endif		
-		if (bits_per_sample == 24 && is_stream_dop(((u8_t *)lptr) + MARKER_OFFSET, ((u8_t *)rptr) + MARKER_OFFSET, 4, frames)) {
+		if (channels <= 2 && bits_per_sample == 24 && is_stream_dop(((u8_t *)lptr) + MARKER_OFFSET, ((u8_t *)rptr) + MARKER_OFFSET, 4, frames)) {
 			LOG_INFO("file contains DOP");
 			if (output.dsdfmt == DOP_S24_LE || output.dsdfmt == DOP_S24_3LE)
 				output.next_fmt = output.dsdfmt;
@@ -200,6 +233,12 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 		output.next_sample_rate = decode_newstream(frame->header.sample_rate, output.supported_rates);
 		if (output.fade_mode) _checkfade(true);
 #endif
+#if PROCESS
+		if (channels > 2) {
+			decode.direct = true;
+			decode.process = false;
+		}
+#endif
 
 		UNLOCK_O;
 	}
@@ -213,7 +252,7 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 
 		IF_DIRECT( 
 			optr = (ISAMPLE_T *)outputbuf->writep; 
-			f = min(_buf_space(outputbuf), _buf_cont_write(outputbuf)) / BYTES_PER_FRAME; 
+			f = min(_buf_space(outputbuf), _buf_cont_write(outputbuf)) / frame_bytes;
 		);
 		IF_PROCESS(
 			optr = (ISAMPLE_T *)process.inbuf;
@@ -224,39 +263,90 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 
 		count = f;
 
-		if (bits_per_sample == 8) {
-			while (count--) {
-				*optr++ = ALIGN8(*lptr++);
-				*optr++ = ALIGN8(*rptr++);
-			}
-		} else if (bits_per_sample == 16) {
-			while (count--) {
-				*optr++ = ALIGN16(*lptr++);
-				*optr++ = ALIGN16(*rptr++);
-			}
-		} else if (bits_per_sample == 20) {
-			while (count--) {
-				*optr++ = ALIGN24(*lptr++ << 4);
-				*optr++ = ALIGN24(*rptr++ << 4);
-			}
-		} else if ( bits_per_sample == 24) {
-			while (count--) {
-				*optr++ = ALIGN24(*lptr++);
-				*optr++ = ALIGN24(*rptr++);
-			}
-		} else if (bits_per_sample == 32) {
-			while (count--) {
-				*optr++ = ALIGN32(*lptr++);
-				*optr++ = ALIGN32(*rptr++);
+		if (channels <= 2) {
+			if (bits_per_sample == 8) {
+				while (count--) {
+					*optr++ = ALIGN8(*lptr++);
+					*optr++ = ALIGN8(*rptr++);
+				}
+			} else if (bits_per_sample == 16) {
+				while (count--) {
+					*optr++ = ALIGN16(*lptr++);
+					*optr++ = ALIGN16(*rptr++);
+				}
+			} else if (bits_per_sample == 20) {
+				while (count--) {
+					*optr++ = ALIGN24(*lptr++ << 4);
+					*optr++ = ALIGN24(*rptr++ << 4);
+				}
+			} else if (bits_per_sample == 24) {
+				while (count--) {
+					*optr++ = ALIGN24(*lptr++);
+					*optr++ = ALIGN24(*rptr++);
+				}
+			} else if (bits_per_sample == 32) {
+				while (count--) {
+					*optr++ = ALIGN32(*lptr++);
+					*optr++ = ALIGN32(*rptr++);
+				}
+			} else {
+				LOG_ERROR("unsupported bits per sample: %u", bits_per_sample);
 			}
 		} else {
-			LOG_ERROR("unsupported bits per sample: %u", bits_per_sample);
+			const signed char *map = flac_to_cea861_map[channels];
+			frames_t i;
+			u8_t ch;
+
+			if (bits_per_sample == 8) {
+				for (i = 0; i < count; ++i) {
+					size_t idx = offset + i;
+					for (ch = 0; ch < out_channels; ++ch) {
+						signed char src_ch = map[ch];
+						*optr++ = (src_ch >= 0) ? ALIGN8(buffer[src_ch][idx]) : 0;
+					}
+				}
+			} else if (bits_per_sample == 16) {
+				for (i = 0; i < count; ++i) {
+					size_t idx = offset + i;
+					for (ch = 0; ch < out_channels; ++ch) {
+						signed char src_ch = map[ch];
+						*optr++ = (src_ch >= 0) ? ALIGN16(buffer[src_ch][idx]) : 0;
+					}
+				}
+			} else if (bits_per_sample == 20) {
+				for (i = 0; i < count; ++i) {
+					size_t idx = offset + i;
+					for (ch = 0; ch < out_channels; ++ch) {
+						signed char src_ch = map[ch];
+						*optr++ = (src_ch >= 0) ? ALIGN24(buffer[src_ch][idx] << 4) : 0;
+					}
+				}
+			} else if (bits_per_sample == 24) {
+				for (i = 0; i < count; ++i) {
+					size_t idx = offset + i;
+					for (ch = 0; ch < out_channels; ++ch) {
+						signed char src_ch = map[ch];
+						*optr++ = (src_ch >= 0) ? ALIGN24(buffer[src_ch][idx]) : 0;
+					}
+				}
+			} else if (bits_per_sample == 32) {
+				for (i = 0; i < count; ++i) {
+					size_t idx = offset + i;
+					for (ch = 0; ch < out_channels; ++ch) {
+						signed char src_ch = map[ch];
+						*optr++ = (src_ch >= 0) ? ALIGN32(buffer[src_ch][idx]) : 0;
+					}
+				}
+			} else {
+				LOG_ERROR("unsupported bits per sample: %u", bits_per_sample);
+			}
 		}
 
 		frames -= f;
+		offset += f;
 
 		IF_DIRECT(
-			_buf_inc_writep(outputbuf, f * BYTES_PER_FRAME);
+			_buf_inc_writep(outputbuf, f * frame_bytes);
 		);
 		IF_PROCESS(
 			process.in_frames = f;

@@ -28,6 +28,7 @@
 
 #define READ_SIZE  4096 * 4   // this is large enough to ensure ffmpeg always gets new data when decode is called
 #define WRITE_SIZE 256 * 1024 // FIXME - make smaller, but still to absorb max wma output
+#define SPDIF_WRITE_SIZE (64 * 1024)
 
 // FIXME - do we need to align these params as per ffmpeg on i386? 
 #define attribute_align_arg
@@ -37,13 +38,18 @@
 struct ff_s {
 	// state for ffmpeg decoder
 	bool wma;
+	bool bitstream_mode;
+	char bitstream_format;
+	u8_t bitstream_channels;
 	u8_t wma_mmsh;
 	u8_t wma_playstream;
 	u8_t wma_metadatastream;
 	u8_t *readbuf;
+	u8_t *writebuf;
 	bool end_of_stream;
 	const AVInputFormat *input_format;
 	AVFormatContext *formatC;
+	AVFormatContext *out_formatC;
 	AVCodecContext *codecC;
 	AVCodecParameters *codecP;
 	AVFrame *frame;
@@ -63,9 +69,19 @@ struct ff_s {
 	AVCodecContext * (* avcodec_alloc_context3)(const AVCodec *);
 	void (* avcodec_free_context)(AVCodecContext **);
 	int (* avcodec_parameters_to_context)(AVCodecContext *, const AVCodecParameters *);
+	int (* avcodec_parameters_copy)(AVCodecParameters *, const AVCodecParameters *);
 	// ffmpeg symbols to be dynamically loaded from libavformat
 	unsigned (* avformat_version)(void);
 	AVFormatContext * (* avformat_alloc_context)(void);
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(59,0,0)
+	int (* avformat_alloc_output_context2)(AVFormatContext **, const AVOutputFormat *, const char *, const char *);
+#else
+	int (* avformat_alloc_output_context2)(AVFormatContext **, AVOutputFormat *, const char *, const char *);
+#endif
+	AVStream * (* avformat_new_stream)(AVFormatContext *, const AVCodec *);
+	int (* avformat_write_header)(AVFormatContext *, AVDictionary **);
+	int (* av_interleaved_write_frame)(AVFormatContext *, AVPacket *);
+	int (* av_write_trailer)(AVFormatContext *);
 	void (* avformat_free_context)(AVFormatContext *);
 #if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(59,0,0)
 	int (* avformat_open_input)(AVFormatContext **, const char *, const AVInputFormat *, AVDictionary **);
@@ -73,8 +89,14 @@ struct ff_s {
 	int (* avformat_open_input)(AVFormatContext **, const char *, AVInputFormat *, AVDictionary **);
 #endif
 	int (* avformat_find_stream_info)(AVFormatContext *, AVDictionary **);
-	AVIOContext * (* avio_alloc_context)(unsigned char *, int, int,	void *,
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61,0,0)
+	AVIOContext * (* avio_alloc_context)(unsigned char *, int, int, void *,
+		int (*read_packet)(void *, uint8_t *, int), int (*write_packet)(void *, const uint8_t *, int), int64_t (*seek)(void *, int64_t, int));
+#else
+	AVIOContext * (* avio_alloc_context)(unsigned char *, int, int, void *,
 		int (*read_packet)(void *, uint8_t *, int), int (*write_packet)(void *, uint8_t *, int), int64_t (*seek)(void *, int64_t, int));
+#endif
+	void (* avio_flush)(AVIOContext *);
 	AVPacket * (* av_packet_alloc)(void);
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58,133,100)
 	void (* av_init_packet)(AVPacket *);
@@ -92,6 +114,8 @@ struct ff_s {
 	int  (* av_strerror)(int, char *, size_t);
 	void * (* av_malloc)(size_t);
 	void (* av_freep)(void *);
+	int (* av_dict_set)(AVDictionary **, const char *, const char *, int);
+	void (* av_dict_free)(AVDictionary **);
 #endif
 };
 
@@ -265,6 +289,42 @@ static int _read_data(void *opaque, u8_t *buffer, int buf_size) {
 	return bytes;
 }
 
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61,0,0)
+static int _write_spdif_data(void *opaque, const u8_t *buffer, int buf_size) {
+#else
+static int _write_spdif_data(void *opaque, u8_t *buffer, int buf_size) {
+#endif
+	int remain = buf_size;
+	const u8_t *src = buffer;
+	unsigned frame_bytes = output_frame_bytes(ff->bitstream_channels, true);
+
+	while (remain > 0) {
+		unsigned space, chunk;
+
+		LOCK_O;
+		space = _buf_space(outputbuf);
+		space = (space / frame_bytes) * frame_bytes;
+		if (space > 0) {
+			chunk = min((unsigned)remain, space);
+			chunk = min(chunk, _buf_cont_write(outputbuf));
+			memcpy(outputbuf->writep, src, chunk);
+			_buf_inc_writep(outputbuf, chunk);
+			src += chunk;
+			remain -= (int)chunk;
+			UNLOCK_O;
+			continue;
+		}
+		UNLOCK_O;
+
+		if (decode.state == DECODE_STOPPED || stream.state == DISCONNECT) {
+			return AVERROR_EXIT;
+		}
+		usleep(2000);
+	}
+
+	return buf_size;
+}
+
 static decode_state ff_decode(void) {
 	int r;
 	s32_t *optr = NULL;
@@ -293,7 +353,10 @@ static decode_state ff_decode(void) {
 		}
 
 		ff->formatC->pb = avio;
-		ff->formatC->flags |= AVFMT_FLAG_CUSTOM_IO | AVFMT_FLAG_NOPARSE;
+		ff->formatC->flags |= AVFMT_FLAG_CUSTOM_IO;
+		if (!ff->bitstream_mode) {
+			ff->formatC->flags |= AVFMT_FLAG_NOPARSE;
+		}
 
 #if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(59,0,0)
 		o = AVFORMAT(ff, open_input, &ff->formatC, "", (AVInputFormat *)ff->input_format, NULL);
@@ -337,27 +400,8 @@ static decode_state ff_decode(void) {
 		}
 
 		av_stream = ff->formatC->streams[audio_stream];
-
-		ff->codecC = AVCODEC (ff, alloc_context3, NULL);
-		if ( ff->codecC == NULL ) {
-			LOG_ERROR("can't allocate avctx");
-			return DECODE_ERROR;
-		}
-
 		ff->codecP = av_stream->codecpar;
 
-		if ( (AVCODEC(ff, parameters_to_context, ff->codecC, ff->codecP) ) < 0) {
-			AVCODEC(ff, free_context, &ff->codecC);
-
-			LOG_ERROR("can't initialize avctx");
-			return DECODE_ERROR;
-		}
-
-		codec = AVCODEC(ff, find_decoder, ff->codecP->codec_id);
-
-		AVCODEC(ff, open2, ff->codecC, codec, NULL);
-
-		ff->frame = AV(ff, frame_alloc);
 		ff->avpkt = AV(ff, packet_alloc);
 		if (ff->avpkt == NULL) {
 			LOG_ERROR("can't allocate avpkt");
@@ -368,18 +412,108 @@ static decode_state ff_decode(void) {
 		AV(ff, init_packet, ff->avpkt); // on older ffmpeg, this still is needed to e.g. set ->pos to -1
 #endif
 
-		LOCK_O;
-		LOG_INFO("setting track_start");
-		output.next_sample_rate = decode_newstream(ff->codecP->sample_rate, output.supported_rates);
-		IF_DSD(	output.next_fmt = PCM; )
-		output.track_start = outputbuf->writep;
-		if (output.fade_mode) _checkfade(true);
-		decode.new_stream = false;
-		UNLOCK_O;
+		if (ff->bitstream_mode) {
+			AVStream *out_stream;
+			AVDictionary *opts = NULL;
+			AVIOContext *out_avio;
+
+			if (!ff->writebuf) {
+				ff->writebuf = AV(ff, malloc, SPDIF_WRITE_SIZE);
+			}
+			out_avio = AVIO(ff, alloc_context, ff->writebuf, SPDIF_WRITE_SIZE, 1, NULL, NULL, _write_spdif_data, NULL);
+			if (!out_avio) {
+				LOG_ERROR("can't allocate spdif avio");
+				return DECODE_ERROR;
+			}
+			out_avio->seekable = 0;
+
+			o = AVFORMAT(ff, alloc_output_context2, &ff->out_formatC, NULL, "spdif", NULL);
+			if (o < 0 || !ff->out_formatC) {
+				LOG_ERROR("avformat_alloc_output_context2 (spdif): %d %s", o, av__err2str(o));
+				AV(ff, freep, &out_avio->buffer);
+				ff->writebuf = NULL;
+				AV(ff, freep, &out_avio);
+				return DECODE_ERROR;
+			}
+
+			ff->out_formatC->pb = out_avio;
+			ff->out_formatC->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+			out_stream = AVFORMAT(ff, new_stream, ff->out_formatC, NULL);
+			if (!out_stream) {
+				LOG_ERROR("can't allocate spdif output stream");
+				return DECODE_ERROR;
+			}
+
+			if (AVCODEC(ff, parameters_copy, out_stream->codecpar, ff->codecP) < 0) {
+				LOG_ERROR("can't copy codecpar to spdif stream");
+				return DECODE_ERROR;
+			}
+			out_stream->codecpar->codec_tag = 0;
+
+			if (ff->bitstream_format == 'H') {
+				AV(ff, dict_set, &opts, "dtshd_rate", "768000", 0);
+			}
+
+			o = AVFORMAT(ff, write_header, ff->out_formatC, &opts);
+			AV(ff, dict_free, &opts);
+			if (o < 0) {
+				LOG_ERROR("avformat_write_header (spdif): %d %s", o, av__err2str(o));
+				return DECODE_ERROR;
+			}
+
+			LOCK_O;
+			LOG_INFO("setting bitstream track_start (fmt=%c, ch=%u, rate=192000)", ff->bitstream_format, ff->bitstream_channels);
+			output.next_sample_rate = 192000;
+			output.next_channels = ff->bitstream_channels;
+			output.next_is_bitstream = true;
+			output.next_replay_gain = FIXED_ONE;
+			IF_DSD( output.next_fmt = PCM; )
+			output.track_start = outputbuf->writep;
+			output.fade = FADE_INACTIVE;
+#if PROCESS
+			decode.direct = true;
+			decode.process = false;
+#endif
+			decode.new_stream = false;
+			UNLOCK_O;
+		} else {
+			ff->codecC = AVCODEC (ff, alloc_context3, NULL);
+			if ( ff->codecC == NULL ) {
+				LOG_ERROR("can't allocate avctx");
+				return DECODE_ERROR;
+			}
+
+			if ( (AVCODEC(ff, parameters_to_context, ff->codecC, ff->codecP) ) < 0) {
+				AVCODEC(ff, free_context, &ff->codecC);
+
+				LOG_ERROR("can't initialize avctx");
+				return DECODE_ERROR;
+			}
+
+			codec = AVCODEC(ff, find_decoder, ff->codecP->codec_id);
+
+			AVCODEC(ff, open2, ff->codecC, codec, NULL);
+
+			ff->frame = AV(ff, frame_alloc);
+
+			LOCK_O;
+			LOG_INFO("setting track_start");
+			output.next_sample_rate = decode_newstream(ff->codecP->sample_rate, output.supported_rates);
+			IF_DSD(	output.next_fmt = PCM; )
+			output.track_start = outputbuf->writep;
+			if (output.fade_mode) _checkfade(true);
+			decode.new_stream = false;
+			UNLOCK_O;
+		}
 	}
 
 	if ((r = AV(ff, read_frame, ff->formatC, ff->avpkt)) < 0) {
 		if (r == AVERROR_EOF) {
+			if (ff->bitstream_mode && ff->out_formatC) {
+				AV(ff, write_trailer, ff->out_formatC);
+				AVIO(ff, flush, ff->out_formatC->pb);
+			}
 			if (ff->end_of_stream) {
 				LOG_INFO("decode complete");
 				return DECODE_COMPLETE;
@@ -388,6 +522,22 @@ static decode_state ff_decode(void) {
 			}
 		} else {
 			LOG_ERROR("av_read_frame error: %i %s", r, av__err2str(r));
+		}
+		return DECODE_RUNNING;
+	}
+
+	if (ff->bitstream_mode) {
+		ff->avpkt->stream_index = 0;
+		ff->avpkt->pos = -1;
+		r = AV(ff, interleaved_write_frame, ff->out_formatC, ff->avpkt);
+		AVIO(ff, flush, ff->out_formatC->pb);
+		AV(ff, packet_unref, ff->avpkt);
+		if (r < 0) {
+			if (decode.state == DECODE_STOPPED) {
+				return DECODE_STOPPED;
+			}
+			LOG_ERROR("spdif mux error: %i %s", r, av__err2str(r));
+			return DECODE_ERROR;
 		}
 		return DECODE_RUNNING;
 	}
@@ -570,6 +720,16 @@ static decode_state ff_decode(void) {
 }
 
 static void _free_ff_data(void) {
+	if (ff->out_formatC) {
+		if (ff->out_formatC->pb) {
+			AV(ff, freep, &ff->out_formatC->pb->buffer);
+			ff->writebuf = NULL;
+			AV(ff, freep, &ff->out_formatC->pb);
+		}
+		AVFORMAT(ff, free_context, ff->out_formatC);
+		ff->out_formatC = NULL;
+	}
+
 	if (ff->codecC) {
 		AVCODEC(ff, free_context, &ff->codecC);
 		ff->codecC = NULL;
@@ -609,6 +769,7 @@ static void ff_open_wma(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
 	}
 
 	ff->wma = true;
+	ff->bitstream_mode = false;
 	ff->wma_mmsh = size - '0';
 	ff->wma_playstream = rate - 1;
 	ff->wma_metadatastream = chan != '?' ? chan : 0;
@@ -625,9 +786,52 @@ static void ff_open_alac(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
 	}
 
 	ff->wma = false;
+	ff->bitstream_mode = false;
 	ff->wma_mmsh = 0;
 
 	LOG_INFO("open alac");
+}
+
+static void ff_open_ec3(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
+	_free_ff_data();
+	ff->input_format = AV(ff, find_input_format, "eac3");
+	if (ff->input_format == NULL) {
+		LOG_ERROR("eac3 format not supported by ffmpeg library");
+	}
+	ff->wma = false;
+	ff->wma_mmsh = 0;
+	ff->bitstream_mode = true;
+	ff->bitstream_format = 'E';
+	ff->bitstream_channels = 2;
+	LOG_INFO("open eac3 bitstream passthrough");
+}
+
+static void ff_open_thd(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
+	_free_ff_data();
+	ff->input_format = AV(ff, find_input_format, "truehd");
+	if (ff->input_format == NULL) {
+		LOG_ERROR("truehd format not supported by ffmpeg library");
+	}
+	ff->wma = false;
+	ff->wma_mmsh = 0;
+	ff->bitstream_mode = true;
+	ff->bitstream_format = 'T';
+	ff->bitstream_channels = 8;
+	LOG_INFO("open truehd bitstream passthrough (HBR 8ch)");
+}
+
+static void ff_open_dtshd(u8_t size, u8_t rate, u8_t chan, u8_t endianness) {
+	_free_ff_data();
+	ff->input_format = AV(ff, find_input_format, "dts");
+	if (ff->input_format == NULL) {
+		LOG_ERROR("dts format not supported by ffmpeg library");
+	}
+	ff->wma = false;
+	ff->wma_mmsh = 0;
+	ff->bitstream_mode = true;
+	ff->bitstream_format = 'H';
+	ff->bitstream_channels = 8;
+	LOG_INFO("open dts-hd bitstream passthrough (HBR 8ch, dtshd_rate=768000)");
 }
 
 static void ff_close(void) {
@@ -673,6 +877,7 @@ static bool load_ff() {
 	ff->avcodec_alloc_context3 = dlsym(handle_format, "avcodec_alloc_context3");
 	ff->avcodec_free_context = dlsym(handle_format, "avcodec_free_context");
 	ff->avcodec_parameters_to_context = dlsym(handle_format, "avcodec_parameters_to_context");
+	ff->avcodec_parameters_copy = dlsym(handle_codec, "avcodec_parameters_copy");
 	ff->av_packet_alloc = dlsym(handle_codec, "av_packet_alloc");
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58,133,100)
 	ff->av_init_packet = dlsym(handle_codec, "av_init_packet");
@@ -688,10 +893,16 @@ static bool load_ff() {
 
 	ff->avformat_version = dlsym(handle_format, "avformat_version");
 	ff->avformat_alloc_context = dlsym(handle_format, "avformat_alloc_context");
+	ff->avformat_alloc_output_context2 = dlsym(handle_format, "avformat_alloc_output_context2");
+	ff->avformat_new_stream = dlsym(handle_format, "avformat_new_stream");
+	ff->avformat_write_header = dlsym(handle_format, "avformat_write_header");
+	ff->av_interleaved_write_frame = dlsym(handle_format, "av_interleaved_write_frame");
+	ff->av_write_trailer = dlsym(handle_format, "av_write_trailer");
 	ff->avformat_free_context = dlsym(handle_format, "avformat_free_context");
 	ff->avformat_open_input = dlsym(handle_format, "avformat_open_input");
 	ff->avformat_find_stream_info = dlsym(handle_format, "avformat_find_stream_info");
 	ff->avio_alloc_context = dlsym(handle_format, "avio_alloc_context");
+	ff->avio_flush = dlsym(handle_format, "avio_flush");
 	ff->av_read_frame = dlsym(handle_format, "av_read_frame");
 	ff->av_find_input_format= dlsym(handle_format, "av_find_input_format");
 #if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(58,9,100)
@@ -711,6 +922,8 @@ static bool load_ff() {
 	ff->av_strerror = dlsym(handle_util, "av_strerror");
 	ff->av_malloc = dlsym(handle_util, "av_malloc");
 	ff->av_freep = dlsym(handle_util, "av_freep");
+	ff->av_dict_set = dlsym(handle_util, "av_dict_set");
+	ff->av_dict_free = dlsym(handle_util, "av_dict_free");
 
 	if ((err = dlerror()) != NULL) {
 		LOG_INFO("dlerror: %s", err);		
@@ -798,7 +1011,49 @@ struct codec *register_ff(const char *codec) {
 			ff_decode,   // decode
 		};
 		
-		LOG_INFO("using ffmpeg to decode alc");		
+		LOG_INFO("using ffmpeg to decode alc");
+		return &ret;
+	}
+
+	if (!strcmp(codec, "ec3")) {
+		static struct codec ret = {
+			'E',         // id
+			"ec3",       // types
+			READ_SIZE,   // min read
+			SPDIF_WRITE_SIZE, // min space
+			ff_open_ec3, // open
+			ff_close,    // close
+			ff_decode,   // decode
+		};
+		LOG_INFO("using ffmpeg spdif muxer for ec3 bitstream");
+		return &ret;
+	}
+
+	if (!strcmp(codec, "thd")) {
+		static struct codec ret = {
+			'T',         // id
+			"thd",       // types
+			READ_SIZE,   // min read
+			SPDIF_WRITE_SIZE, // min space
+			ff_open_thd, // open
+			ff_close,    // close
+			ff_decode,   // decode
+		};
+		LOG_INFO("using ffmpeg spdif muxer for thd bitstream");
+		return &ret;
+	}
+
+	if (!strcmp(codec, "dtshd")) {
+		static struct codec ret = {
+			'H',         // id
+			"dtshd",     // types
+			READ_SIZE,   // min read
+			SPDIF_WRITE_SIZE, // min space
+			ff_open_dtshd, // open
+			ff_close,    // close
+			ff_decode,   // decode
+		};
+		LOG_INFO("using ffmpeg spdif muxer for dtshd bitstream");
 		return &ret;
 	}
 

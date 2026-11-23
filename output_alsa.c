@@ -33,7 +33,7 @@
 #include <malloc.h>
 #include <math.h>
 
-#define MAX_DEVICE_LEN 128
+#define MAX_DEVICE_LEN 256
 
 static snd_pcm_format_t fmts[] = { SND_PCM_FORMAT_S32_LE, SND_PCM_FORMAT_S24_LE, SND_PCM_FORMAT_S24_3LE, SND_PCM_FORMAT_S16_LE,
 								   SND_PCM_FORMAT_UNKNOWN };
@@ -50,6 +50,7 @@ static struct {
 	char *ctl;
 	char *mixer_ctl;
 	snd_pcm_format_t format;
+	snd_pcm_format_t configured_format;
 #if DSD
 	dsd_format outfmt;
 	snd_pcm_format_t pcmfmt;
@@ -57,9 +58,12 @@ static struct {
 	snd_pcm_uframes_t buffer_size;
 	snd_pcm_uframes_t period_size;
 	unsigned rate;
+	unsigned channels;
+	bool is_bitstream;
 	bool mmap;
 	bool reopen;
 	u8_t *write_buf;
+	size_t write_buf_size;
 	const char *volume_mixer_name;
 	bool mixer_linear;
 	snd_mixer_elem_t* mixer_elem;
@@ -338,25 +342,45 @@ static int alsa_open(const char *device, unsigned sample_rate, unsigned alsa_buf
 	// close if already open
 	if (pcmp) alsa_close();
 
+	unsigned target_channels = output.out_channels ? output.out_channels : 2;
+	bool is_bitstream = output.is_bitstream;
+	bool appended_aes = false;
+
 	// reset params
 	alsa.rate = 0;
+	alsa.channels = 0;
+	alsa.is_bitstream = false;
+	alsa.format = alsa.configured_format;
 #if DSD
 	alsa.outfmt = PCM;
 #endif
 	alsa.period_size = 0;
-	strcpy(alsa.device, device);
 
-	if (strlen(device) > MAX_DEVICE_LEN - 4 - 1) {
+	if (strlen(device) > MAX_DEVICE_LEN - 48) {
 		LOG_ERROR("device name too long: %s", device);
 		return -1;
 	}
 
-	LOG_INFO("opening device at: %u", sample_rate);
+	strcpy(alsa.device, device);
+	if (is_bitstream && !strstr(alsa.device, "AES0=") &&
+	    (!strncmp(alsa.device, "hdmi", 4) || !strncmp(alsa.device, "iec958", 6) || !strncmp(alsa.device, "spdif", 5))) {
+		strcat(alsa.device, strchr(alsa.device, ':') ? ",AES0=0x06,AES1=0x82,AES2=0x00,AES3=0x0e" : ":AES0=0x06,AES1=0x82,AES2=0x00,AES3=0x0e");
+		appended_aes = true;
+	}
+
+	LOG_INFO("opening device %s at: %u ch: %u bitstream: %d", alsa.device, sample_rate, target_channels, is_bitstream);
 
 	bool retry;
 	do {
 		// open device
 		if ((err = snd_pcm_open(&pcmp, alsa.device, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+			if (appended_aes) {
+				LOG_INFO("open with AES0 params failed (%s), retrying base device %s", snd_strerror(err), device);
+				strcpy(alsa.device, device);
+				appended_aes = false;
+				retry = true;
+				continue;
+			}
 			LOG_ERROR("playback open error: %s", snd_strerror(err));
 			return err;
 		}
@@ -399,26 +423,30 @@ static int alsa_open(const char *device, unsigned sample_rate, unsigned alsa_buf
 	}
 
 	// set the sample format
+	if (is_bitstream) {
+		alsa.format = SND_PCM_FORMAT_S16_LE;
+	} else {
 #if DSD
-	switch (outfmt) {
-	case DSD_U8:
-		alsa.format = SND_PCM_FORMAT_DSD_U8; break;
-	case DSD_U16_LE:
-		alsa.format = SND_PCM_FORMAT_DSD_U16_LE; break;
-	case DSD_U16_BE:
-		alsa.format = SND_PCM_FORMAT_DSD_U16_BE; break;
-	case DSD_U32_LE:
-		alsa.format = SND_PCM_FORMAT_DSD_U32_LE; break;
-	case DSD_U32_BE:
-		alsa.format = SND_PCM_FORMAT_DSD_U32_BE; break;
-	case DOP_S24_LE:
-		alsa.format = SND_PCM_FORMAT_S24_LE; break;
-	case DOP_S24_3LE:
-		alsa.format = SND_PCM_FORMAT_S24_3LE; break;
-	default:
-		alsa.format = alsa.pcmfmt;
-	}
+		switch (outfmt) {
+		case DSD_U8:
+			alsa.format = SND_PCM_FORMAT_DSD_U8; break;
+		case DSD_U16_LE:
+			alsa.format = SND_PCM_FORMAT_DSD_U16_LE; break;
+		case DSD_U16_BE:
+			alsa.format = SND_PCM_FORMAT_DSD_U16_BE; break;
+		case DSD_U32_LE:
+			alsa.format = SND_PCM_FORMAT_DSD_U32_LE; break;
+		case DSD_U32_BE:
+			alsa.format = SND_PCM_FORMAT_DSD_U32_BE; break;
+		case DOP_S24_LE:
+			alsa.format = SND_PCM_FORMAT_S24_LE; break;
+		case DOP_S24_3LE:
+			alsa.format = SND_PCM_FORMAT_S24_3LE; break;
+		default:
+			alsa.format = alsa.pcmfmt;
+		}
 #endif
+	}
 	snd_pcm_format_t *fmt = alsa.format ? &alsa.format : (snd_pcm_format_t *)fmts;
 	do {
 		if (snd_pcm_hw_params_set_format(pcmp, hw_params, *fmt) >= 0) {
@@ -464,8 +492,8 @@ static int alsa_open(const char *device, unsigned sample_rate, unsigned alsa_buf
 	}
 
 	// set channels
-	if ((err = snd_pcm_hw_params_set_channels (pcmp, hw_params, 2)) < 0) {
-		LOG_ERROR("channel count not available: %s", snd_strerror(err));
+	if ((err = snd_pcm_hw_params_set_channels(pcmp, hw_params, target_channels)) < 0) {
+		LOG_ERROR("channel count %u not available: %s", target_channels, snd_strerror(err));
 		return err;
 	}
 
@@ -518,13 +546,18 @@ static int alsa_open(const char *device, unsigned sample_rate, unsigned alsa_buf
 	// ensure we have two buffer sizes of samples before starting output
 	output.start_frames = alsa.buffer_size * 2;
 
-	// create an intermediate buffer for non mmap case for all but NATIVE_FORMAT
+	// create or grow intermediate buffer for non mmap case for all but NATIVE_FORMAT
 	// this is used to pack samples into the output format before calling writei
-	if (!alsa.mmap && !alsa.write_buf && alsa.format != NATIVE_FORMAT) {
-		alsa.write_buf = malloc(alsa.buffer_size * BYTES_PER_FRAME);
-		if (!alsa.write_buf) {
-			LOG_ERROR("unable to malloc write_buf");
-			return -1;
+	if (!alsa.mmap && (alsa.format != NATIVE_FORMAT || is_bitstream)) {
+		size_t needed = alsa.buffer_size * output_frame_bytes(target_channels, is_bitstream);
+		if (needed > alsa.write_buf_size) {
+			u8_t *nbuf = realloc(alsa.write_buf, needed);
+			if (!nbuf) {
+				LOG_ERROR("unable to malloc write_buf");
+				return -1;
+			}
+			alsa.write_buf = nbuf;
+			alsa.write_buf_size = needed;
 		}
 	}
 
@@ -543,6 +576,8 @@ static int alsa_open(const char *device, unsigned sample_rate, unsigned alsa_buf
 
 	// this indicates we have opened the device ok
 	alsa.rate = sample_rate;
+	alsa.channels = target_channels;
+	alsa.is_bitstream = is_bitstream;
 #if DSD
 	alsa.outfmt = outfmt;
 #endif
@@ -593,7 +628,7 @@ static int _write_frames(frames_t out_frames, bool silence, s32_t gainL, s32_t g
 		}
 	)
 
-	if (alsa.mmap || alsa.format != NATIVE_FORMAT) {
+	if (alsa.mmap || alsa.format != NATIVE_FORMAT || output.is_bitstream) {
 
 		outputptr = alsa.mmap ? (areas[0].addr + (areas[0].first + offset * areas[0].step) / 8) : alsa.write_buf;
 
@@ -679,10 +714,11 @@ static void *output_thread(void *arg) {
 			probe_device = false;
 		}
 #if DSD
-		if (!pcmp || alsa.rate != output.current_sample_rate || alsa.outfmt != output.outfmt ) {
+		if (!pcmp || alsa.rate != output.current_sample_rate || alsa.outfmt != output.outfmt ||
+		    alsa.channels != output.out_channels || alsa.is_bitstream != output.is_bitstream) {
 #else
-
-		if (!pcmp || alsa.rate != output.current_sample_rate) {
+		if (!pcmp || alsa.rate != output.current_sample_rate ||
+		    alsa.channels != output.out_channels || alsa.is_bitstream != output.is_bitstream) {
 #endif
 #if GPIO
 			// Wake up amp
@@ -850,6 +886,13 @@ static void *output_thread(void *arg) {
 			output.frames_played_dmp = output.frames_played;
 		}
 
+		// re-verify ALSA device config under LOCK in case track_start or flush changed output format
+		if (alsa.channels != output.out_channels || alsa.is_bitstream != output.is_bitstream ||
+		    alsa.rate != output.current_sample_rate) {
+			UNLOCK;
+			continue;
+		}
+
 		// process frames
 		frames_t wrote = _output_frames(avail);
 
@@ -950,6 +993,8 @@ void output_init_alsa(log_level level, const char *device, unsigned output_buf_s
 
 	alsa.mmap = alsa_mmap;
 	alsa.write_buf = NULL;
+	alsa.write_buf_size = 0;
+	alsa.configured_format = 0;
 #if DSD
 	alsa.pcmfmt = 0;
 #else
@@ -975,11 +1020,13 @@ void output_init_alsa(log_level level, const char *device, unsigned output_buf_s
 		if (!strcmp(alsa_sample_fmt, "24")) alsa.pcmfmt = SND_PCM_FORMAT_S24_LE;
 		if (!strcmp(alsa_sample_fmt, "24_3")) alsa.pcmfmt = SND_PCM_FORMAT_S24_3LE;
 		if (!strcmp(alsa_sample_fmt, "16")) alsa.pcmfmt = SND_PCM_FORMAT_S16_LE;
+		alsa.configured_format = alsa.pcmfmt;
 #else
 		if (!strcmp(alsa_sample_fmt, "32"))	alsa.format = SND_PCM_FORMAT_S32_LE;
 		if (!strcmp(alsa_sample_fmt, "24")) alsa.format = SND_PCM_FORMAT_S24_LE;
 		if (!strcmp(alsa_sample_fmt, "24_3")) alsa.format = SND_PCM_FORMAT_S24_3LE;
 		if (!strcmp(alsa_sample_fmt, "16")) alsa.format = SND_PCM_FORMAT_S16_LE;
+		alsa.configured_format = alsa.format;
 #endif
 	}
 
@@ -1019,7 +1066,7 @@ void output_init_alsa(log_level level, const char *device, unsigned output_buf_s
 	LOG_INFO("glibc detected using mallopt");
 #endif
 
-	touch_memory(silencebuf, MAX_SILENCE_FRAMES * BYTES_PER_FRAME);
+	touch_memory(silencebuf, MAX_SILENCE_FRAMES * MAX_CHANNELS * sizeof(s32_t));
 	touch_memory(outputbuf->buf, outputbuf->size);
 #endif
 

@@ -1,14 +1,14 @@
-/* 
+/*
  *  Squeezelite - lightweight headless squeezebox emulator
  *
  *  (c) Adrian Smith 2012-2015, triode1@btinternet.com
  *      Ralph Irving 2015-2026, ralph_irving@hotmail.com
- *  
+ *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
- * 
+ *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
@@ -124,16 +124,16 @@ static void sendHELO(bool reconnect, const char *fixed_cap, const char *var_cap,
 	#define SSL_CAP "CanHTTPS=1"
 	const char *base_cap;
 	struct HELO_packet pkt;
-	
+
 #if USE_SSL
 #if !LINKALL && !NO_SSLSYM
 	if (ssl_loaded) base_cap = SSL_CAP "," BASE_CAP;
 	else base_cap = BASE_CAP;
-#endif	
+#endif
 	base_cap = SSL_CAP "," BASE_CAP;
 #else
 	base_cap = BASE_CAP;
-#endif	
+#endif
 
 	memset(&pkt, 0, sizeof(pkt));
 	memcpy(&pkt.opcode, "HELO", 4);
@@ -171,7 +171,7 @@ static void sendSTAT(const char *event, u32_t server_timestamp) {
 		LOG_SDEBUG("ms_played: 0");
 		ms_played = 0;
 	}
-	
+
 	memset(&pkt, 0, sizeof(struct STAT_packet));
 	memcpy(&pkt.opcode, "STAT", 4);
 	pkt.length = htonl(sizeof(struct STAT_packet) - 8);
@@ -292,7 +292,7 @@ static void process_strm(u8_t *pkt, int len) {
 		sendSTAT("STMf", 0);
 		buf_flush(streambuf);
 		break;
-	case 'f': 
+	case 'f':
 		{
 			decode_flush();
 			// we can have fully finished the current streaming, that's still a flush
@@ -324,7 +324,7 @@ static void process_strm(u8_t *pkt, int len) {
 			unsigned interval = unpackN(&strm->replay_gain);
 			LOCK_O;
 			output.skip_frames = interval * status.current_sample_rate / 1000;
-			output.state = OUTPUT_SKIP_FRAMES;				
+			output.state = OUTPUT_SKIP_FRAMES;
 			UNLOCK_O;
 			LOG_DEBUG("skip ahead interval: %u", interval);
 		}
@@ -347,11 +347,22 @@ static void process_strm(u8_t *pkt, int len) {
 			char *header = (char *)(pkt + sizeof(struct strm_packet));
 			in_addr_t ip = (in_addr_t)strm->server_ip; // keep in network byte order
 			u16_t port = strm->server_port; // keep in network byte order
-			if (ip == 0) ip = slimproto_ip; 
+			if (ip == 0) ip = slimproto_ip;
 
-			LOG_DEBUG("strm s autostart: %c transition period: %u transition type: %u codec: %c", 
-					  strm->autostart, strm->transition_period, strm->transition_type - '0', strm->format);
-			
+			bool is_bitstream = (strm->format == 'E' || strm->format == 'T' || strm->format == 'H');
+			u8_t out_ch = 2;
+
+			if (is_bitstream) {
+				out_ch = (strm->format == 'E') ? 2 : 8;
+			} else if (strm->pcm_channels >= '3' && strm->pcm_channels <= '6') {
+				out_ch = 6;
+			} else if (strm->pcm_channels == '7' || strm->pcm_channels == '8') {
+				out_ch = 8;
+			}
+
+			LOG_DEBUG("strm s autostart: %c transition period: %u transition type: %u codec: %c pcm_channels: %c (out_ch=%u, bitstream=%d)",
+					  strm->autostart, strm->transition_period, strm->transition_type - '0', strm->format, strm->pcm_channels, out_ch, is_bitstream);
+
 			autostart = strm->autostart - '0';
 
 			sendSTAT("STMf", 0);
@@ -359,6 +370,10 @@ static void process_strm(u8_t *pkt, int len) {
 				LOG_WARN("header too long: %u", header_len);
 				break;
 			}
+			LOCK_O;
+			output.next_channels = out_ch;
+			output.next_is_bitstream = is_bitstream;
+			UNLOCK_O;
 			if (strm->format != '?') {
 				codec_open(strm->format, strm->pcm_sample_size, strm->pcm_sample_rate, strm->pcm_channels, strm->pcm_endianness);
 			} else if (autostart >= 2) {
@@ -373,7 +388,7 @@ static void process_strm(u8_t *pkt, int len) {
 				stream_file(header, header_len, strm->threshold * 1024);
 				autostart -= 2;
 			} else {
-				stream_sock(ip, port, strm->flags & 0x20, 
+				stream_sock(ip, port, strm->flags & 0x20,
 						    strm->format == 'o' || strm->format == 'u' || (strm->format == 'f' && strm->pcm_sample_size == 'o'),
 							header, header_len, strm->threshold * 1024, autostart >= 2);
 			}
@@ -381,12 +396,15 @@ static void process_strm(u8_t *pkt, int len) {
 			sentSTMu = sentSTMo = sentSTMl = false;
 			LOCK_O;
 			output.threshold = strm->output_threshold;
-			output.next_replay_gain = unpackN(&strm->replay_gain);
-			output.fade_mode = strm->transition_type - '0';
-			output.fade_secs = strm->transition_period;
-			output.invert    = (strm->flags & 0x03) == 0x03;
-			output.channels  = (strm->flags & 0x0c) >> 2;
-			LOG_DEBUG("set fade mode: %u, channels: %u, invert: %u", output.fade_mode, output.channels, output.invert);
+			output.next_replay_gain = is_bitstream ? FIXED_ONE : unpackN(&strm->replay_gain);
+			if (is_bitstream) {
+				output.current_replay_gain = FIXED_ONE;
+			}
+			output.fade_mode = is_bitstream ? FADE_NONE : (strm->transition_type - '0');
+			output.fade_secs = is_bitstream ? 0 : strm->transition_period;
+			output.invert    = is_bitstream ? false : ((strm->flags & 0x03) == 0x03);
+			output.channels  = is_bitstream ? 0 : ((strm->flags & 0x0c) >> 2);
+			LOG_DEBUG("set fade mode: %u, mono flags: %u, out_channels: %u, bitstream: %d, invert: %u", output.fade_mode, output.channels, out_ch, is_bitstream, output.invert);
 			UNLOCK_O;
 		}
 		break;
@@ -416,8 +434,30 @@ static void process_cont(u8_t *pkt, int len) {
 
 static void process_codc(u8_t *pkt, int len) {
 	struct codc_packet *codc = (struct codc_packet *)pkt;
+	bool is_bitstream = (codc->format == 'E' || codc->format == 'T' || codc->format == 'H');
+	u8_t out_ch = 2;
 
-	LOG_DEBUG("codc: %c", codc->format);
+	if (is_bitstream) {
+		out_ch = (codc->format == 'E') ? 2 : 8;
+	} else if (codc->pcm_channels >= '3' && codc->pcm_channels <= '6') {
+		out_ch = 6;
+	} else if (codc->pcm_channels == '7' || codc->pcm_channels == '8') {
+		out_ch = 8;
+	}
+
+	LOCK_O;
+	output.next_channels = out_ch;
+	output.next_is_bitstream = is_bitstream;
+	if (is_bitstream) {
+		output.next_replay_gain = FIXED_ONE;
+		output.current_replay_gain = FIXED_ONE;
+		output.fade_mode = FADE_NONE;
+		output.fade_secs = 0;
+		output.invert = false;
+	}
+	UNLOCK_O;
+
+	LOG_DEBUG("codc: %c (out_ch=%u, bitstream=%d)", codc->format, out_ch, is_bitstream);
 	codec_open(codc->format, codc->pcm_sample_size, codc->pcm_sample_rate, codc->pcm_channels, codc->pcm_endianness);
 }
 
@@ -485,7 +525,7 @@ static void process_serv(u8_t *pkt, int len) {
 
 	unsigned slimproto_port = 0;
 	char squeezeserver[] = SQUEEZENETWORK;
-	
+
 	if(pkt[4] == 0 && pkt[5] == 0 && pkt[6] == 0 && pkt[7] == 1) {
 		server_addr(squeezeserver, &new_server, &slimproto_port);
 	} else {
@@ -506,7 +546,7 @@ static void process_serv(u8_t *pkt, int len) {
 			free(new_server_cap);
 			new_server_cap = NULL;
 		}
-	}		
+	}
 }
 
 struct handler {
@@ -557,7 +597,7 @@ static void slimproto_run() {
 		event_type ev;
 
 		if ((ev = wait_readwake(ehandles, 1000)) != EVENT_TIMEOUT) {
-	
+
 			if (ev == EVENT_READ) {
 
 				if (expect > 0) {
@@ -645,13 +685,13 @@ static void slimproto_run() {
 			status.stream_size = streambuf->size;
 			status.stream_bytes = stream.bytes;
 			status.stream_state = stream.state;
-						
+
 			if (stream.state == DISCONNECT) {
 				disconnect_code = stream.disconnect;
 				stream.state = STOPPED;
 				_sendDSCO = true;
 			}
-			if (!stream.sent_headers && 
+			if (!stream.sent_headers &&
 				(stream.state == STREAMING_HTTP || stream.state == STREAMING_WAIT || stream.state == STREAMING_BUFFERING)) {
 				header_len = stream.header_len;
 				memcpy(header, stream.header, header_len);
@@ -690,7 +730,7 @@ static void slimproto_run() {
 			}
 			_decode_state = decode.state;
 			UNLOCK_D;
-			
+
 			LOCK_O;
 			status.output_full = _buf_used(outputbuf);
 			status.output_size = outputbuf->size;
@@ -698,7 +738,7 @@ static void slimproto_run() {
 			status.current_sample_rate = output.current_sample_rate;
 			status.updated = output.updated;
 			status.device_frames = output.device_frames;
-			
+
 			if (output.track_started) {
 				_sendSTMs = true;
 				output.track_started = false;
@@ -822,7 +862,7 @@ in_addr_t discover_server(char *default_server) {
 	return s.sin_addr.s_addr;
 }
 
-#define FIXED_CAP_LEN 256
+#define FIXED_CAP_LEN 512
 #define VAR_CAP_LEN   128
 
 void slimproto(log_level level, char *server, u8_t mac[6], const char *name, const char *namefile, const char *modelname, int maxSampleRate) {
@@ -886,12 +926,20 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 #else
 			 ((maxSampleRate > 0 && maxSampleRate < output.supported_rates[0]) ? maxSampleRate : output.supported_rates[0]));
 #endif
-	
+
 	for (i = 0; i < MAX_CODECS; i++) {
 		if (codecs[i] && codecs[i]->id && strlen(fixed_cap) < FIXED_CAP_LEN - 10) {
 			strcat(fixed_cap, ",");
 			strcat(fixed_cap, codecs[i]->types);
 		}
+	}
+	if (strlen(fixed_cap) < FIXED_CAP_LEN - 32) {
+		strcat(fixed_cap, ",mch=8");
+#if FFMPEG
+		if (!strstr(fixed_cap, ",ec3")) {
+			strcat(fixed_cap, ",ec3,thd,dtshd");
+		}
+#endif
 	}
 	UNLOCK_O;
 

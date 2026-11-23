@@ -168,6 +168,14 @@ void decode_init(log_level level, const char *include_codecs, const char *exclud
 	if (!strstr(exclude_codecs, "wma")	&& (!include_codecs || (order_codecs = strstr(include_codecs, "wma"))))
 		sort_codecs((include_codecs ? order_codecs - include_codecs : i), register_ff("wma"));
 #endif
+#if FFMPEG
+	if (!strstr(exclude_codecs, "ec3") && (!include_codecs || (order_codecs = strstr(include_codecs, "ec3"))))
+		sort_codecs((include_codecs ? order_codecs - include_codecs : i), register_ff("ec3"));
+	if (!strstr(exclude_codecs, "thd") && (!include_codecs || (order_codecs = strstr(include_codecs, "thd"))))
+		sort_codecs((include_codecs ? order_codecs - include_codecs : i), register_ff("thd"));
+	if (!strstr(exclude_codecs, "dtshd") && (!include_codecs || (order_codecs = strstr(include_codecs, "dtshd"))))
+		sort_codecs((include_codecs ? order_codecs - include_codecs : i), register_ff("dtshd"));
+#endif
 #ifndef NO_FAAD
 	if (!strstr(exclude_codecs, "aac")	&& (!include_codecs || (order_codecs = strstr(include_codecs, "aac"))))
 		sort_codecs((include_codecs ? order_codecs - include_codecs : i), register_faad());
@@ -264,8 +272,9 @@ unsigned decode_newstream(unsigned sample_rate, unsigned supported_rates[]) {
 	);
 
 	// reduce threshold if we don't have enough room in outputbuf
-	if (output.threshold * sample_rate / 10 > outputbuf->size / BYTES_PER_FRAME / 2) {
-		output.threshold = (outputbuf->size / BYTES_PER_FRAME / 2 * 10) / sample_rate;
+	unsigned frame_bytes = output_frame_bytes(output.next_channels, output.next_is_bitstream);
+	if (output.threshold * sample_rate / 10 > outputbuf->size / frame_bytes / 2) {
+		output.threshold = (outputbuf->size / frame_bytes / 2 * 10) / sample_rate;
 		LOG_WARN("output buffer too small - reducing threshold to %d ms", output.threshold * 10);
 	}
 
