@@ -1,6 +1,6 @@
 # Squeezelite - Multichannel PCM & IEC 61937 Bitstream Passthrough Branch
 
-This fork of [Squeezelite](https://github.com/triode/squeezelite) adds native support for high-bitrate multichannel PCM (up to 7.1 channels) and direct IEC 61937 HDMI bitstream passthrough for Dolby Digital Plus Atmos (`E-AC-3`), Dolby TrueHD Atmos, and DTS-HD Master Audio / Auro-3D. It operates seamlessly with Logitech Media Server (LMS) and the `lms-multichannel-audio` plugin.
+This fork of [Squeezelite](https://github.com/triode/squeezelite) adds native support for high-bitrate multichannel PCM (up to 7.1 channels) and direct IEC 61937 HDMI bitstream passthrough for Dolby Digital Plus Atmos (`E-AC-3`), Dolby TrueHD Atmos, and DTS-HD Master Audio / Auro-3D. It operates seamlessly with Logitech Media Server (LMS) and the `lms-multichannel-audio` plugin. It has been tested only on a NUC 11 i3 machine, with a LibreELEC installation.
 
 ---
 
