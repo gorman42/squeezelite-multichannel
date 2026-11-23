@@ -48,6 +48,8 @@ struct ff_s {
 	u8_t *readbuf;
 	u8_t *writebuf;
 	bool end_of_stream;
+	bool stream_completed;
+	bool header_written;
 	bool trailer_written;
 	int64_t spdif_pts;
 	const AVInputFormat *input_format;
@@ -101,6 +103,7 @@ struct ff_s {
 #endif
 	void (* avio_flush)(AVIOContext *);
 	AVPacket * (* av_packet_alloc)(void);
+	int (* av_new_packet)(AVPacket *, int);
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58,133,100)
 	void (* av_init_packet)(AVPacket *);
 #endif
@@ -364,73 +367,77 @@ static decode_state ff_decode(void) {
 
 		ff->mmsh_bytes_left = ff->mmsh_bytes_pad = ff->mmsh_packet_len = 0;
 
-		if (!ff->readbuf) {
-			ff->readbuf = AV(ff, malloc, READ_SIZE +  AV_INPUT_BUFFER_PADDING_SIZE);
-		}
+		if (!(ff->bitstream_mode && ff->bitstream_format == 'T')) {
+			if (!ff->readbuf) {
+				ff->readbuf = AV(ff, malloc, READ_SIZE +  AV_INPUT_BUFFER_PADDING_SIZE);
+			}
 
-		avio = AVIO(ff, alloc_context, ff->readbuf, READ_SIZE, 0, NULL, _read_data, NULL, NULL);
-		avio->seekable = 0;
+			avio = AVIO(ff, alloc_context, ff->readbuf, READ_SIZE, 0, NULL, _read_data, NULL, NULL);
+			avio->seekable = 0;
 
-		ff->formatC = AVFORMAT(ff, alloc_context);
-		if (ff->formatC == NULL) {
-			LOG_ERROR("null context");
-			return DECODE_ERROR;
-		}
+			ff->formatC = AVFORMAT(ff, alloc_context);
+			if (ff->formatC == NULL) {
+				LOG_ERROR("null context");
+				return DECODE_ERROR;
+			}
 
-		ff->formatC->pb = avio;
-		ff->formatC->flags |= AVFMT_FLAG_CUSTOM_IO;
-		if (!ff->bitstream_mode) {
-			ff->formatC->flags |= AVFMT_FLAG_NOPARSE;
-		}
+			ff->formatC->pb = avio;
+			ff->formatC->flags |= AVFMT_FLAG_CUSTOM_IO;
+			if (!ff->bitstream_mode) {
+				ff->formatC->flags |= AVFMT_FLAG_NOPARSE;
+			}
 
 #if LIBAVFORMAT_VERSION_INT < AV_VERSION_INT(59,0,0)
-		o = AVFORMAT(ff, open_input, &ff->formatC, "", (AVInputFormat *)ff->input_format, NULL);
+			o = AVFORMAT(ff, open_input, &ff->formatC, "", (AVInputFormat *)ff->input_format, NULL);
 #else
-		o = AVFORMAT(ff, open_input, &ff->formatC, "", ff->input_format, NULL);
+			o = AVFORMAT(ff, open_input, &ff->formatC, "", ff->input_format, NULL);
 #endif
-		if (o < 0) {
-			LOG_WARN("avformat_open_input: %d %s", o, av__err2str(o));
-			return DECODE_ERROR;
-		}
-
-		LOG_INFO("format: name:%s lname:%s", ff->formatC->iformat->name, ff->formatC->iformat->long_name);
-
-		if (ff->bitstream_mode) {
-			ff->formatC->probesize = 16384;
-			ff->formatC->max_analyze_duration = 100000;
-		}
-	
-		o = AVFORMAT(ff, find_stream_info, ff->formatC, NULL);
-		if (o < 0) {
-			LOG_WARN("avformat_find_stream_info: %d %s", o, av__err2str(o));
-			return DECODE_ERROR;
-		}
-		
-		if (ff->wma && ff->wma_playstream < ff->formatC->nb_streams) {
-			if (ff->formatC->streams[ff->wma_playstream]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-				LOG_INFO("using wma stream sent from server: %i", ff->wma_playstream);
-				audio_stream = ff->wma_playstream;
+			if (o < 0) {
+				LOG_WARN("avformat_open_input: %d %s", o, av__err2str(o));
+				return DECODE_ERROR;
 			}
-		}
 
-		if (audio_stream == -1) {
-			unsigned int i;
-			for (i = 0; i < ff->formatC->nb_streams; ++i) {
-				if (ff->formatC->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-					audio_stream = i;
-					LOG_INFO("found stream: %i", i);
-					break;
+			LOG_INFO("format: name:%s lname:%s", ff->formatC->iformat->name, ff->formatC->iformat->long_name);
+
+			if (ff->bitstream_mode) {
+				ff->formatC->probesize = 16384;
+				ff->formatC->max_analyze_duration = 100000;
+			}
+		
+			o = AVFORMAT(ff, find_stream_info, ff->formatC, NULL);
+			if (o < 0) {
+				LOG_WARN("avformat_find_stream_info: %d %s", o, av__err2str(o));
+				return DECODE_ERROR;
+			}
+			
+			if (ff->wma && ff->wma_playstream < ff->formatC->nb_streams) {
+				if (ff->formatC->streams[ff->wma_playstream]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+					LOG_INFO("using wma stream sent from server: %i", ff->wma_playstream);
+					audio_stream = ff->wma_playstream;
 				}
 			}
-		}
 
-		if (audio_stream == -1) {
-			LOG_WARN("no audio stream found");
-			return DECODE_ERROR;
-		}
+			if (audio_stream == -1) {
+				unsigned int i;
+				for (i = 0; i < ff->formatC->nb_streams; ++i) {
+					if (ff->formatC->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+						audio_stream = i;
+						LOG_INFO("found stream: %i", i);
+						break;
+					}
+				}
+			}
 
-		av_stream = ff->formatC->streams[audio_stream];
-		ff->codecP = av_stream->codecpar;
+			if (audio_stream == -1) {
+				LOG_WARN("no audio stream found");
+				return DECODE_ERROR;
+			}
+
+			av_stream = ff->formatC->streams[audio_stream];
+			ff->codecP = av_stream->codecpar;
+		} else {
+			ff->codecP = NULL;
+		}
 
 		ff->avpkt = AV(ff, packet_alloc);
 		if (ff->avpkt == NULL) {
@@ -476,9 +483,29 @@ static decode_state ff_decode(void) {
 					return DECODE_ERROR;
 				}
 
-				if (AVCODEC(ff, parameters_copy, out_stream->codecpar, ff->codecP) < 0) {
-					LOG_ERROR("can't copy codecpar to spdif stream");
-					return DECODE_ERROR;
+				if (ff->codecP) {
+					if (AVCODEC(ff, parameters_copy, out_stream->codecpar, ff->codecP) < 0) {
+						LOG_ERROR("can't copy codecpar to spdif stream");
+						return DECODE_ERROR;
+					}
+				} else {
+					int thd_rate = 48000;
+					LOCK_S;
+					if (_buf_used(streambuf) >= 12) {
+						u8_t ms[12];
+						size_t c = _buf_cont_read(streambuf);
+						for (size_t k = 0; k < 12; k++) {
+							ms[k] = (k < c) ? streambuf->readp[k] : streambuf->buf[k - c];
+						}
+						if (ms[4] == 0xF8 && ms[5] == 0x72 && ms[6] == 0x6F && ms[7] == 0xBA) {
+							u8_t rb = (ms[8] >> 4) & 0x0F;
+							thd_rate = ((rb & 8) ? 44100 : 48000) << (rb & 7);
+						}
+					}
+					UNLOCK_S;
+					out_stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+					out_stream->codecpar->codec_id = AV_CODEC_ID_TRUEHD;
+					out_stream->codecpar->sample_rate = thd_rate;
 				}
 				out_stream->codecpar->codec_tag = 0;
 
@@ -493,6 +520,7 @@ static decode_state ff_decode(void) {
 					return DECODE_ERROR;
 				}
 				ff->out_bitstream_format = ff->bitstream_format;
+				ff->header_written = true;
 				ff->trailer_written = false;
 				ff->spdif_pts = 0;
 			} else {
@@ -545,13 +573,78 @@ static decode_state ff_decode(void) {
 		}
 	}
 
-	if ((r = AV(ff, read_frame, ff->formatC, ff->avpkt)) < 0) {
-		if (r == AVERROR_EOF) {
-			if (ff->bitstream_mode && ff->bitstream_format == 'T' && ff->out_formatC && !ff->trailer_written) {
-				ff->trailer_written = true;
-				AV(ff, write_trailer, ff->out_formatC);
-				AVIO(ff, flush, ff->out_formatC->pb);
+	if (ff->bitstream_mode && ff->bitstream_format == 'T') {
+		unsigned wait_ms = 0;
+		size_t avail, au_words, au_bytes, cont, copied;
+		u8_t hdr[2];
+
+		while (1) {
+			LOCK_S;
+			avail = _buf_used(streambuf);
+			if (avail >= 4) {
+				break;
 			}
+			if (stream.state <= DISCONNECT) {
+				UNLOCK_S;
+				ff->end_of_stream = true;
+				ff->stream_completed = true;
+				LOG_INFO("decode complete");
+				return DECODE_COMPLETE;
+			}
+			UNLOCK_S;
+			if (decode.state != DECODE_RUNNING || wait_ms >= 2000) {
+				return DECODE_STOPPED;
+			}
+			usleep(2000);
+			wait_ms += 2;
+		}
+
+		cont = _buf_cont_read(streambuf);
+		hdr[0] = streambuf->readp[0];
+		hdr[1] = (cont >= 2) ? streambuf->readp[1] : streambuf->buf[0];
+		au_words = ((hdr[0] & 0x0F) << 8) | hdr[1];
+		au_bytes = au_words * 2;
+		if (au_bytes < 10 || au_bytes > 4096) {
+			UNLOCK_S;
+			LOG_ERROR("invalid TrueHD access unit size: %zu", au_bytes);
+			return DECODE_ERROR;
+		}
+
+		while (avail < au_bytes) {
+			if (stream.state <= DISCONNECT) {
+				UNLOCK_S;
+				ff->end_of_stream = true;
+				ff->stream_completed = true;
+				LOG_INFO("decode complete");
+				return DECODE_COMPLETE;
+			}
+			UNLOCK_S;
+			if (decode.state != DECODE_RUNNING || wait_ms >= 2000) {
+				return DECODE_STOPPED;
+			}
+			usleep(2000);
+			wait_ms += 2;
+			LOCK_S;
+			avail = _buf_used(streambuf);
+		}
+
+		if (AV(ff, new_packet, ff->avpkt, (int)au_bytes) < 0) {
+			UNLOCK_S;
+			LOG_ERROR("can't allocate TrueHD packet (%zu bytes)", au_bytes);
+			return DECODE_ERROR;
+		}
+		copied = 0;
+		while (copied < au_bytes) {
+			size_t chunk = min(au_bytes - copied, _buf_cont_read(streambuf));
+			memcpy(ff->avpkt->data + copied, streambuf->readp, chunk);
+			_buf_inc_readp(streambuf, chunk);
+			copied += chunk;
+		}
+		ff->end_of_stream = false;
+		UNLOCK_S;
+	} else if ((r = AV(ff, read_frame, ff->formatC, ff->avpkt)) < 0) {
+		if (r == AVERROR_EOF) {
+			ff->stream_completed = true;
 			LOG_INFO("decode complete");
 			return DECODE_COMPLETE;
 		} else if (r == AVERROR_EXIT || decode.state != DECODE_RUNNING) {
@@ -563,6 +656,15 @@ static decode_state ff_decode(void) {
 	}
 
 	if (ff->bitstream_mode) {
+		if (ff->bitstream_format == 'T' && ff->spdif_pts == 0) {
+			// Fresh spdifenc muxer requires its first TrueHD packet to contain a Major Sync header (0xF8726FBA)
+			if (ff->avpkt->size < 22 ||
+			    ff->avpkt->data[4] != 0xF8 || ff->avpkt->data[5] != 0x72 ||
+			    ff->avpkt->data[6] != 0x6F || ff->avpkt->data[7] != 0xBA) {
+				AV(ff, packet_unref, ff->avpkt);
+				return DECODE_RUNNING;
+			}
+		}
 		int64_t pkt_dur = ff->avpkt->duration > 0 ? ff->avpkt->duration : 40;
 		ff->avpkt->stream_index = 0;
 		ff->avpkt->pos = -1;
@@ -761,7 +863,7 @@ static decode_state ff_decode(void) {
 
 static void _free_ff_spdif(void) {
 	if (ff->out_formatC) {
-		if (!ff->trailer_written && ff->out_formatC->pb) {
+		if (ff->header_written && !ff->trailer_written && ff->out_formatC->pb) {
 			ff->trailer_written = true;
 			AV(ff, write_trailer, ff->out_formatC);
 			AVIO(ff, flush, ff->out_formatC->pb);
@@ -775,6 +877,8 @@ static void _free_ff_spdif(void) {
 		ff->out_formatC = NULL;
 	}
 	ff->out_bitstream_format = 0;
+	ff->stream_completed = false;
+	ff->header_written = false;
 	ff->trailer_written = false;
 	ff->spdif_pts = 0;
 }
@@ -816,10 +920,13 @@ static void _free_ff_data(void) {
 }
 
 static void _prepare_bitstream_open(char fmt) {
+	bool natural_eof = ff->stream_completed;
+	ff->stream_completed = false;
 	_free_ff_input();
 	LOCK_O;
-	bool keep_spdif = (fmt != 'T' && ff->out_formatC != NULL && ff->out_bitstream_format == fmt &&
-	                   output.is_bitstream && output.state > OUTPUT_STOPPED);
+	bool keep_spdif = (ff->out_formatC != NULL && ff->out_bitstream_format == fmt &&
+	                   output.is_bitstream && output.state > OUTPUT_STOPPED &&
+	                   (fmt != 'T' || natural_eof));
 	UNLOCK_O;
 	if (!keep_spdif) {
 		_free_ff_spdif();
@@ -945,6 +1052,7 @@ static bool load_ff() {
 	ff->avcodec_parameters_to_context = dlsym(handle_format, "avcodec_parameters_to_context");
 	ff->avcodec_parameters_copy = dlsym(handle_codec, "avcodec_parameters_copy");
 	ff->av_packet_alloc = dlsym(handle_codec, "av_packet_alloc");
+	ff->av_new_packet = dlsym(handle_codec, "av_new_packet");
 #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58,133,100)
 	ff->av_init_packet = dlsym(handle_codec, "av_init_packet");
 #endif
