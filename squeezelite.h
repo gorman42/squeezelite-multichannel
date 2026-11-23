@@ -711,6 +711,8 @@ struct outputstate {
 #endif
 };
 
+extern unsigned hdmi_delay;
+
 void output_init_common(log_level level, const char *device, unsigned output_buf_size, unsigned rates[], unsigned idle);
 void output_close_common(void);
 void output_flush(void);

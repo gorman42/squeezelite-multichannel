@@ -934,7 +934,7 @@ void slimproto(log_level level, char *server, u8_t mac[6], const char *name, con
 		}
 	}
 	if (strlen(fixed_cap) < FIXED_CAP_LEN - 32) {
-		strcat(fixed_cap, ",mch=8");
+		strcat(fixed_cap, ",mch=8,mch8");
 #if FFMPEG
 		if (!strstr(fixed_cap, ",ec3")) {
 			strcat(fixed_cap, ",ec3,thd,dtshd");

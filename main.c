@@ -96,6 +96,7 @@ static void usage(const char *argv0) {
 #endif
 		   "  -e <codec1>,<codec2>\tExplicitly exclude native support of one or more codecs; known codecs: " CODECS "\n"
 		   "  -f <logfile>\t\tWrite debug to logfile\n"
+		   "  -h <delay>\t\tSilence delay in ms on HDMI channel/bitstream format change (default: %u)\n"
 #if IR
 		   "  -i [<filename>]\tEnable lirc remote control support (lirc config file ~/.lircrc used if filename not specified)\n"
 #endif
@@ -245,7 +246,7 @@ static void usage(const char *argv0) {
 		   " LINKALL"
 #endif
 		   "\n\n",
-		   argv0,STREAMBUF_SIZE/1024,OUTPUTBUF_SIZE/1024);
+		   argv0,STREAMBUF_SIZE/1024,OUTPUTBUF_SIZE/1024,hdmi_delay);
 }
 
 static void license(void) {
@@ -366,7 +367,7 @@ int main(int argc, char **argv) {
 
 	while (optind < argc && strlen(argv[optind]) >= 2 && argv[optind][0] == '-') {
 		char *opt = argv[optind] + 1;
-		if (strstr("oabcCdefmMnNpPrsZ"
+		if (strstr("oabcCdefhmMnNpPrsZ"
 #if ALSA
 				   "UVO"
 #endif
@@ -459,6 +460,9 @@ int main(int argc, char **argv) {
 			break;
 		case 'f':
 			logfile = optarg;
+			break;
+		case 'h':
+			hdmi_delay = (unsigned)atoi(optarg);
 			break;
 		case 'm':
 			{

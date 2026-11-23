@@ -161,18 +161,19 @@ static FLAC__StreamDecoderReadStatus read_cb(const FLAC__StreamDecoder *decoder,
 	return end ? FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM : FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
 }
 
-// FLAC (SMPTE/ITU-R) to ALSA CEA-861 speaker swizzle lookup table
+// FLAC (SMPTE/ITU-R) to Linux ALSA standard speaker swizzle lookup table
+// ALSA slot order: 0=FL, 1=FR, 2=RL, 3=RR, 4=FC, 5=LFE, 6=SL, 7=SR
 // Index is ALSA output channel (0..7); value is FLAC buffer[] index, or -1 for silence fill
 static const signed char flac_to_cea861_map[9][MAX_CHANNELS] = {
 	{ -1, -1, -1, -1, -1, -1, -1, -1 }, // 0: invalid
-	{  0,  0, -1, -1, -1, -1, -1, -1 }, // 1: 1.0 Mono -> L, R
+	{  0,  0, -1, -1, -1, -1, -1, -1 }, // 1: 1.0 Mono -> FL, FR
 	{  0,  1, -1, -1, -1, -1, -1, -1 }, // 2: 2.0 Stereo -> FL, FR
-	{  0,  1, -1,  2, -1, -1, -1, -1 }, // 3: 3.0 (FL,FR,FC) -> FL, FR, Silence, FC, Silence, Silence
-	{  0,  1, -1, -1,  2,  3, -1, -1 }, // 4: 4.0 Quad (FL,FR,BL,BR) -> FL, FR, Silence, Silence, BL, BR
-	{  0,  1, -1,  2,  3,  4, -1, -1 }, // 5: 5.0 (FL,FR,FC,BL,BR) -> FL, FR, Silence, FC, BL, BR
-	{  0,  1,  3,  2,  4,  5, -1, -1 }, // 6: 5.1 (FL,FR,FC,LFE,BL,BR) -> FL, FR, LFE, FC, BL, BR
-	{  0,  1,  3,  2,  5,  6,  4, -1 }, // 7: 6.1 (FL,FR,FC,LFE,BC,SL,SR) -> FL, FR, LFE, FC, SL, SR, BC, Silence
-	{  0,  1,  3,  2,  4,  5,  6,  7 }, // 8: 7.1 (FL,FR,FC,LFE,BL,BR,SL,SR) -> FL, FR, LFE, FC, BL, BR, SL, SR
+	{  0,  1, -1, -1,  2, -1, -1, -1 }, // 3: 3.0 (FL,FR,FC) -> FL, FR, Silence, Silence, FC, Silence
+	{  0,  1,  2,  3, -1, -1, -1, -1 }, // 4: 4.0 Quad (FL,FR,BL,BR) -> FL, FR, RL, RR, Silence, Silence
+	{  0,  1,  3,  4,  2, -1, -1, -1 }, // 5: 5.0 (FL,FR,FC,BL,BR) -> FL, FR, RL, RR, FC, Silence
+	{  0,  1,  4,  5,  2,  3, -1, -1 }, // 6: 5.1 (FL,FR,FC,LFE,BL,BR) -> FL, FR, RL, RR, FC, LFE
+	{  0,  1,  4, -1,  2,  3,  5,  6 }, // 7: 6.1 (FL,FR,FC,LFE,BC,SL,SR) -> FL, FR, RL(BC), Silence, FC, LFE, SL, SR
+	{  0,  1,  4,  5,  2,  3,  6,  7 }, // 8: 7.1 (FL,FR,FC,LFE,BL,BR,SL,SR) -> FL, FR, RL, RR, FC, LFE, SL, SR
 };
 
 static inline u8_t normalize_hdmi_channels(unsigned channels) {
@@ -249,10 +250,26 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 		frames_t f;
 		frames_t count;
 		ISAMPLE_T *optr;
+		ISAMPLE_T wrap_tmp[MAX_CHANNELS];
+		bool split_wrap = false;
 
 		IF_DIRECT( 
-			optr = (ISAMPLE_T *)outputbuf->writep; 
-			f = min(_buf_space(outputbuf), _buf_cont_write(outputbuf)) / frame_bytes;
+			unsigned space = _buf_space(outputbuf);
+			unsigned cont  = _buf_cont_write(outputbuf);
+			if (space < frame_bytes) {
+				UNLOCK_O_direct;
+				usleep(1000);
+				LOCK_O_direct;
+				continue;
+			}
+			if (cont < frame_bytes) {
+				optr = wrap_tmp;
+				f = 1;
+				split_wrap = true;
+			} else {
+				optr = (ISAMPLE_T *)outputbuf->writep; 
+				f = min(space, cont) / frame_bytes;
+			}
 		);
 		IF_PROCESS(
 			optr = (ISAMPLE_T *)process.inbuf;
@@ -346,6 +363,11 @@ static FLAC__StreamDecoderWriteStatus write_cb(const FLAC__StreamDecoder *decode
 		offset += f;
 
 		IF_DIRECT(
+			if (split_wrap) {
+				size_t part1 = outputbuf->wrap - outputbuf->writep;
+				memcpy(outputbuf->writep, wrap_tmp, part1);
+				memcpy(outputbuf->buf, ((u8_t *)wrap_tmp) + part1, frame_bytes - part1);
+			}
 			_buf_inc_writep(outputbuf, f * frame_bytes);
 		);
 		IF_PROCESS(

@@ -37,6 +37,7 @@ u8_t *silencebuf_dsd;
 #endif
 
 bool user_rates = false;
+unsigned hdmi_delay = 750;
 
 #define LOCK   mutex_lock(outputbuf->mutex)
 #define UNLOCK mutex_unlock(outputbuf->mutex)
@@ -127,7 +128,14 @@ frames_t _output_frames(frames_t avail) {
 		if (output.track_start && !silence) {
 			if (output.track_start == outputbuf->readp) {
 				unsigned delay = 0;
-				if (output.current_sample_rate != output.next_sample_rate) {
+				bool hdmi_fmt_change = (output.out_channels != output.next_channels ||
+				                        output.is_bitstream != output.next_is_bitstream);
+				if (hdmi_fmt_change) {
+					delay = hdmi_delay;
+#if PULSEAUDIO
+					set_sample_rate(output.next_sample_rate);
+#endif
+				} else if (output.current_sample_rate != output.next_sample_rate) {
 					delay = output.rate_delay;
 #if PULSEAUDIO
 					set_sample_rate(output.next_sample_rate);
@@ -139,10 +147,13 @@ frames_t _output_frames(frames_t avail) {
 				   }
 				)
 				frames -= size;
-				// add silence delay in two halves, before and after track start on rate or pcm-dop change
+				// add silence delay before/after track start on rate/dop change, or full post-switch silence on HDMI channel/bitstream change
 				if (delay) {
 					output.state = OUTPUT_PAUSE_FRAMES;
-					if (!output.delay_active) {
+					if (hdmi_fmt_change) {
+						output.pause_frames = output.next_sample_rate * delay / 1000;
+						output.delay_active = false;
+					} else if (!output.delay_active) {
 						output.pause_frames = output.current_sample_rate * delay / 2000;
 						output.delay_active = true;  // first delay - don't process track start
 						break;
@@ -279,13 +290,34 @@ frames_t _output_frames(frames_t avail) {
 			}
 		}
 
-		out_frames = !silence ? min(size, cont_frames) : size;
-
 		IF_DSD(
 			if (output.outfmt != PCM) {
 				flags = 0;
 			}
 		)
+
+		if (!silence && cont_frames == 0) {
+			// Single frame straddles outputbuf->wrap after a mid-buffer stride change
+			static u8_t wrap_scratch[MAX_CHANNELS * sizeof(s32_t)];
+			size_t part1 = outputbuf->wrap - outputbuf->readp;
+			u8_t *saved_readp = outputbuf->readp;
+			memcpy(wrap_scratch, outputbuf->readp, part1);
+			memcpy(wrap_scratch + part1, outputbuf->buf, frame_bytes - part1);
+			outputbuf->readp = wrap_scratch;
+			wrote = output.write_cb(1, false, gainL, gainR, flags, cross_gain_in, cross_gain_out, &cross_ptr);
+			outputbuf->readp = saved_readp;
+			if (wrote <= 0) {
+				frames -= size;
+				break;
+			}
+			out_frames = 1;
+			size -= 1;
+			_buf_inc_readp(outputbuf, frame_bytes);
+			output.frames_played += 1;
+			continue;
+		}
+
+		out_frames = !silence ? min(size, cont_frames) : size;
 
 		wrote = output.write_cb(out_frames, silence, gainL, gainR, flags, cross_gain_in, cross_gain_out, &cross_ptr);
 
