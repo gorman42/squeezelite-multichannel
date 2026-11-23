@@ -182,7 +182,14 @@ frames_t _output_frames(frames_t avail) {
 				break;
 			} else if (output.track_start > outputbuf->readp) {
 				// reduce cont_frames so we find the next track start at beginning of next chunk
-				cont_frames = min(cont_frames, (output.track_start - outputbuf->readp) / frame_bytes);
+				frames_t to_start = (output.track_start - outputbuf->readp) / frame_bytes;
+				if (to_start > 0) {
+					cont_frames = min(cont_frames, to_start);
+				} else {
+					// output.track_start is misaligned within the current frame; align readp to track_start
+					outputbuf->readp = output.track_start;
+					continue;
+				}
 			}
 		}
 
