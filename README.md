@@ -31,11 +31,11 @@ This fork of [Squeezelite](https://github.com/triode/squeezelite) adds native su
 
 ### Standard Linux Build
 
-Ensure dependencies are installed (`libalsa-dev`, `libffmpeg-dev`, `libflac-dev`, `libmad0-dev` or `libmpg123-dev`, `libfaad-dev`):
+Ensure dependencies are installed (`libasound2-dev`, `libavcodec-dev`, `libavformat-dev`, `libavutil-dev`, `libflac-dev`, `libsoxr-dev`, `libmad0-dev` or `libmpg123-dev`, `libfaad-dev`):
 
 ```bash
 make clean
-make
+make OPTS="-DFFMPEG -DRESAMPLE"
 ```
 
 ### Build Flags
@@ -43,6 +43,7 @@ make
 Standard Squeezelite Makefile flags apply:
 - `-DFFMPEG`: Enables FFmpeg decoding and bitstream `spdif` encapsulation.
 - `-DALSA`: Enables ALSA hardware output driver with HDMI `AES0` controls.
+- `-DRESAMPLE`: Enables client-side SoX resampling (`libsoxr`) for `-R` / `-u` flags (e.g., locked sample-rate pipelines such as CamillaDSP).
 - `-DMAD` / `-DFAAD`: Enable MP3 and AAC decoding libraries.
 
 ---
