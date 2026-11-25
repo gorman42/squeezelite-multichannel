@@ -732,6 +732,18 @@ static void *output_thread(void *arg) {
 			LOG_INFO("open output device: %s", output.device);
 			LOCK;
 
+			// If a previous open failed (e.g. ALSA loopback locked to another channel count)
+			// and a new track is already buffered, adopt its pending format before retrying
+			if (output.error_opening && output.state == OUTPUT_BUFFER) {
+				if (output.next_channels) {
+					output.out_channels = output.next_channels;
+				}
+				output.is_bitstream = output.next_is_bitstream;
+				if (output.next_sample_rate) {
+					output.current_sample_rate = output.next_sample_rate;
+				}
+			}
+
 			// FIXME - some alsa hardware requires opening twice for a new sample rate to work
 			// this is a workaround which should be removed
 			if (alsa.reopen) {
@@ -746,9 +758,25 @@ static void *output_thread(void *arg) {
 #else
 			if (!!alsa_open(output.device, output.current_sample_rate, output.buffer, output.period)) {
 #endif
+				if (pcmp) {
+					alsa_close();
+					pcmp = NULL;
+				}
 				output.error_opening = true;
 				UNLOCK;
-				sleep(5);
+				// Sleep up to 5s, waking early if a new track with a different format is buffered
+				for (int i = 0; i < 50 && running; ++i) {
+					usleep(100000);
+					LOCK;
+					bool format_pending = (output.state == OUTPUT_BUFFER &&
+						((output.next_channels && output.next_channels != output.out_channels) ||
+						 output.next_is_bitstream != output.is_bitstream ||
+						 (output.next_sample_rate && output.next_sample_rate != output.current_sample_rate)));
+					UNLOCK;
+					if (format_pending) {
+						break;
+					}
+				}
 				continue;
 			}
 			output.error_opening = false;
