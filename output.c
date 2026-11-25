@@ -146,7 +146,7 @@ frames_t _output_frames(frames_t avail) {
 					   delay = output.dsd_delay;
 				   }
 				)
-				frames -= size;
+				if (delay) frames -= size;
 				// add silence delay before/after track start on rate/dop change, or full post-switch silence on HDMI channel/bitstream change
 				if (delay) {
 					output.state = OUTPUT_PAUSE_FRAMES;
@@ -179,7 +179,8 @@ frames_t _output_frames(frames_t avail) {
 					output.current_replay_gain = output.next_replay_gain;
 				}
 				output.track_start = NULL;
-				break;
+				if (delay) break;
+				continue;
 			} else if (output.track_start > outputbuf->readp) {
 				// reduce cont_frames so we find the next track start at beginning of next chunk
 				frames_t to_start = (output.track_start - outputbuf->readp) / frame_bytes;

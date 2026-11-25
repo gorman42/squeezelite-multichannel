@@ -1,0 +1,13 @@
+LIBDIR ?= /usr/lib/x86_64-linux-gnu
+FFMPEG_INC ?= /usr/include
+SOXR_DIR ?= ../soxr-static
+FAAD_DIR ?= ../faad2-static
+
+CFLAGS = -Wall -fPIC -O2 -I$(FFMPEG_INC) -I/usr/include/opus -I$(SOXR_DIR)/include -I$(FAAD_DIR)/include
+LDADD = $(LIBDIR)/libFLAC.a $(LIBDIR)/libvorbisfile.a $(LIBDIR)/libvorbis.a $(LIBDIR)/libopusfile.a $(LIBDIR)/libopus.a $(LIBDIR)/libogg.a $(LIBDIR)/libmad.a $(SOXR_DIR)/lib/libsoxr.a $(FAAD_DIR)/lib/libfaad.a -lpthread -ldl -lrt -lm
+OPTS = -DFFMPEG -DRESAMPLE -DOPUS -DVISEXPORT -DDSD -DNO_MPG123
+
+include Makefile
+
+# Statically link all codecs/resampler (including faad) into the binary, while keeping ffmpeg.o in dlopen() mode for LibreELEC
+$(filter-out ffmpeg.o,$(OBJECTS)): OPTS += -DLINKALL

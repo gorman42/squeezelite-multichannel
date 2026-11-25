@@ -367,7 +367,7 @@ static decode_state ff_decode(void) {
 
 		ff->mmsh_bytes_left = ff->mmsh_bytes_pad = ff->mmsh_packet_len = 0;
 
-		if (!(ff->bitstream_mode && ff->bitstream_format == 'T')) {
+		if (!(ff->bitstream_mode && (ff->bitstream_format == 'T' || ff->bitstream_format == 'E'))) {
 			if (!ff->readbuf) {
 				ff->readbuf = AV(ff, malloc, READ_SIZE +  AV_INPUT_BUFFER_PADDING_SIZE);
 			}
@@ -488,6 +488,25 @@ static decode_state ff_decode(void) {
 						LOG_ERROR("can't copy codecpar to spdif stream");
 						return DECODE_ERROR;
 					}
+				} else if (ff->bitstream_format == 'E') {
+					int ec3_rate = 48000;
+					LOCK_S;
+					if (_buf_used(streambuf) >= 6) {
+						u8_t eh[6];
+						size_t c = _buf_cont_read(streambuf);
+						for (size_t k = 0; k < 6; k++) {
+							eh[k] = (k < c) ? streambuf->readp[k] : streambuf->buf[k - c];
+						}
+						if (eh[0] == 0x0B && eh[1] == 0x77) {
+							u8_t fscod = (eh[4] >> 6) & 0x03;
+							if (fscod == 1) ec3_rate = 44100;
+							else if (fscod == 2) ec3_rate = 32000;
+						}
+					}
+					UNLOCK_S;
+					out_stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+					out_stream->codecpar->codec_id = AV_CODEC_ID_EAC3;
+					out_stream->codecpar->sample_rate = ec3_rate;
 				} else {
 					int thd_rate = 48000;
 					LOCK_S;
@@ -631,6 +650,82 @@ static decode_state ff_decode(void) {
 		if (AV(ff, new_packet, ff->avpkt, (int)au_bytes) < 0) {
 			UNLOCK_S;
 			LOG_ERROR("can't allocate TrueHD packet (%zu bytes)", au_bytes);
+			return DECODE_ERROR;
+		}
+		copied = 0;
+		while (copied < au_bytes) {
+			size_t chunk = min(au_bytes - copied, _buf_cont_read(streambuf));
+			memcpy(ff->avpkt->data + copied, streambuf->readp, chunk);
+			_buf_inc_readp(streambuf, chunk);
+			copied += chunk;
+		}
+		ff->end_of_stream = false;
+		UNLOCK_S;
+	} else if (ff->bitstream_mode && ff->bitstream_format == 'E') {
+		unsigned wait_ms = 0;
+		size_t avail, au_bytes, cont, copied;
+		u8_t hdr[4];
+
+		while (1) {
+			LOCK_S;
+			avail = _buf_used(streambuf);
+			if (avail >= 6) {
+				cont = _buf_cont_read(streambuf);
+				hdr[0] = streambuf->readp[0];
+				hdr[1] = (cont >= 2) ? streambuf->readp[1] : streambuf->buf[1 - cont];
+				if (hdr[0] == 0x0B && hdr[1] == 0x77) {
+					break;
+				}
+				_buf_inc_readp(streambuf, 1);
+				UNLOCK_S;
+				continue;
+			}
+			if (stream.state <= DISCONNECT) {
+				UNLOCK_S;
+				ff->end_of_stream = true;
+				ff->stream_completed = true;
+				LOG_INFO("decode complete");
+				return DECODE_COMPLETE;
+			}
+			UNLOCK_S;
+			if (decode.state != DECODE_RUNNING || wait_ms >= 2000) {
+				return DECODE_STOPPED;
+			}
+			usleep(2000);
+			wait_ms += 2;
+		}
+
+		hdr[2] = (cont >= 3) ? streambuf->readp[2] : streambuf->buf[2 - cont];
+		hdr[3] = (cont >= 4) ? streambuf->readp[3] : streambuf->buf[3 - cont];
+		au_bytes = ((((hdr[2] & 0x07) << 8) | hdr[3]) + 1) * 2;
+		if (au_bytes < 6 || au_bytes > 4096) {
+			_buf_inc_readp(streambuf, 2);
+			UNLOCK_S;
+			LOG_WARN("invalid E-AC-3 frame size: %zu", au_bytes);
+			return DECODE_RUNNING;
+		}
+
+		while (avail < au_bytes) {
+			if (stream.state <= DISCONNECT) {
+				UNLOCK_S;
+				ff->end_of_stream = true;
+				ff->stream_completed = true;
+				LOG_INFO("decode complete");
+				return DECODE_COMPLETE;
+			}
+			UNLOCK_S;
+			if (decode.state != DECODE_RUNNING || wait_ms >= 2000) {
+				return DECODE_STOPPED;
+			}
+			usleep(2000);
+			wait_ms += 2;
+			LOCK_S;
+			avail = _buf_used(streambuf);
+		}
+
+		if (AV(ff, new_packet, ff->avpkt, (int)au_bytes) < 0) {
+			UNLOCK_S;
+			LOG_ERROR("can't allocate E-AC-3 packet (%zu bytes)", au_bytes);
 			return DECODE_ERROR;
 		}
 		copied = 0;
